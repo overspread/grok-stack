@@ -302,19 +302,21 @@ def click_signup_method(page):
 def fill_email_and_submit(page, email):
     log.info("[*] 填写邮箱...")
 
-    click_signup_method(page)
-
     inp = find_visible(page, [
         'input[name="email"]',
         'input[type="email"]',
         'input[autocomplete="email"]',
-        'input:not([type="hidden"])',
+        'input[data-testid="email"]',
     ], timeout=5000)
     if inp:
         inp.fill(email)
         log.info(f"[*] 已填入邮箱: {email}")
     else:
         log.warning("未找到邮箱输入框")
+        page.wait_for_timeout(2000)
+        # retry: print all inputs for debug
+        all_inputs = page.evaluate("Array.from(document.querySelectorAll('input')).map(i => i.name + '=' + i.type + ' visible=' + (i.offsetParent!==null))")
+        log.debug(f"页面 inputs: {all_inputs}")
         return False
 
     btn = find_visible(page, [
@@ -322,11 +324,11 @@ def fill_email_and_submit(page, email):
         'button:has-text("Continue")',
         'button:has-text("Sign up")',
         'button:has-text("Next")',
-        'button:has-text("注册")',
     ], timeout=3000)
     if btn:
+        btn_txt = (btn.text_content() or '').strip()[:30]
         btn.click()
-        log.info("[*] 已点击提交")
+        log.info(f"[*] 已点击提交按钮 '{btn_txt}'")
         page.wait_for_timeout(3000)
         return True
     log.warning("未找到提交按钮")
@@ -509,6 +511,14 @@ def main():
 
             # 点击"用邮箱注册"
             click_signup_method(page)
+
+            # 调试: 查看点击后的页面
+            after_click = page.evaluate("""() => {
+                const tags = document.querySelectorAll('button, a, input');
+                return Array.from(tags).slice(0,20).map(e => e.tagName + (e.type ? '['+e.type+']' : '') + (e.name ? ' name='+e.name : '') + ' visible=' + (e.offsetParent!==null) + ' "' + (e.textContent||'').trim().slice(0,30) + '"');
+            }""")
+            for line in after_click:
+                log.debug(f"  点击后元素: {line}")
 
             # 填写邮箱
             if not fill_email_and_submit(page, email):
