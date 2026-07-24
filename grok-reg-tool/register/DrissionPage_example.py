@@ -1054,10 +1054,12 @@ try {
     const wid = turnstile.render(container, {
         sitekey: sitekey,
         callback: onToken,
+        'error-callback': function(e) { window.__cf_error = String(e || ''); },
+        'timeout-callback': function() { window.__cf_error = 'timeout'; },
     });
-
     return String(wid);
 } catch(e) {
+    window.__cf_error = String(e.message || e);
     return '__error__:' + String(e.message || e);
 }
     """, sitekey, container_id)
@@ -1136,7 +1138,7 @@ def getTurnstileToken() -> str:
         print(f"[*] Turnstile widget 已渲染 (id={wid[:20]}), 等待 iframe 加载并点击...")
         clicked = False
         try:
-            page.wait.ele_appear('#cf-turnstile-inject iframe', timeout=15)
+            page.wait.ele('#cf-turnstile-inject iframe', timeout=15)
             iframe_ele = page.ele('#cf-turnstile-inject iframe')
             if iframe_ele:
                 rect = page.run_js("""
@@ -1190,6 +1192,9 @@ document.querySelector('#cf-turnstile-inject iframe')?.dispatchEvent(
         if token:
             print(f"[+] 注入 widget + 点击复选框方式获取 token 成功")
             return token
+        cf_error = page.run_js("return window.__cf_error || '';")
+        if cf_error:
+            print(f"[Warn] Turnstile 错误: {cf_error}")
     else:
         print(f"[Warn] 注入 widget 结果: {wid}")
 
