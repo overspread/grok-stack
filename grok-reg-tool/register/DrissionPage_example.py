@@ -867,9 +867,7 @@ return new Promise((resolve) => {
                     sitekey: sitekey,
                     callback: onToken,
                 });
-                setTimeout(() => {
-                    try { turnstile.execute(wid); } catch(e) {}
-                }, 300);
+                try { turnstile.execute(wid); } catch(e) {}
                 setTimeout(() => resolve('__timeout__'), timeout * 1000);
             } catch(e) {
                 resolve('__render_error__:' + (e.message || e));
@@ -1051,10 +1049,10 @@ try {
         callback: onToken,
     });
 
-    // 延迟一小段时间后程序化触发挑战，让 render 充分初始化
-    setTimeout(() => {
+    // 等一小段时间确保 widget DOM 就绪后再程序化触发挑战
+    setTimeout(function() {
         try { turnstile.execute(wid); } catch(e) { console.warn('execute failed', e); }
-    }, 300);
+    }, 1500);
 
     return String(wid);
 } catch(e) {
