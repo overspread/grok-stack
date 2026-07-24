@@ -1056,11 +1056,6 @@ try {
         callback: onToken,
     });
 
-    // 等一小段时间确保 widget DOM 就绪后再程序化触发挑战
-    setTimeout(function() {
-        try { turnstile.execute(wid); } catch(e) { console.warn('execute failed', e); }
-    }, 1500);
-
     return String(wid);
 } catch(e) {
     return '__error__:' + String(e.message || e);
@@ -1138,10 +1133,31 @@ def getTurnstileToken() -> str:
     _ensure_turnstile_loaded()
     wid = _inject_turnstile_widget()
     if wid and not str(wid).startswith("__"):
-        print(f"[*] Turnstile widget 已渲染 (id={wid[:20]}), 等待 token...")
-        token = _wait_for_turnstile_token_from_widget(timeout=45)
+        print(f"[*] Turnstile widget 已渲染 (id={wid[:20]}), 尝试点击复选框...")
+        time.sleep(2)
+        clicked = False
+        try:
+            iframe_ele = page.ele('#cf-turnstile-inject iframe', timeout=5)
+            if iframe_ele:
+                iframe_ele.click()
+                clicked = True
+                print("[*] 已通过 DrissionPage 点击 Turnstile iframe")
+        except Exception as e:
+            print(f"[Warn] DrissionPage 点击 iframe 失败: {e}")
+        if not clicked:
+            try:
+                page.run_js(r"""
+const iframe = document.querySelector('#cf-turnstile-inject iframe');
+if (iframe) {
+    iframe.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+}
+                """)
+                print("[*] 已通过 JS dispatchEvent 点击 iframe")
+            except Exception as e:
+                print(f"[Warn] JS 点击 iframe 失败: {e}")
+        token = _wait_for_turnstile_token_from_widget(timeout=30)
         if token:
-            print(f"[+] 注入 widget 方式获取 token 成功")
+            print(f"[+] 注入 widget + 点击复选框方式获取 token 成功")
             return token
     else:
         print(f"[Warn] 注入 widget 结果: {wid}")
