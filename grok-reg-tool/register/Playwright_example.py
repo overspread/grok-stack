@@ -327,9 +327,25 @@ def fill_email_and_submit(page, email):
     ], timeout=3000)
     if btn:
         btn_txt = (btn.text_content() or '').strip()[:30]
-        btn.click()
-        log.info(f"[*] 已点击提交按钮 '{btn_txt}'")
-        page.wait_for_timeout(3000)
+        is_disabled = btn.is_disabled()
+        log.info(f"[*] 点击提交按钮 '{btn_txt}' (disabled={is_disabled})")
+        if is_disabled:
+            log.warning("提交按钮被禁用，可能需 Turnstile")
+            # try JS click anyway
+            page.evaluate("document.querySelector('button[type=\"submit\"]')?.click()")
+        else:
+            btn.click()
+        page.wait_for_timeout(2000)
+        page.wait_for_load_state('networkidle', timeout=10000)
+        cur_url = page.url
+        log.info(f"[*] 提交后 URL: {cur_url}")
+        # Check for errors
+        err = page.evaluate("""() => {
+            const els = document.querySelectorAll('[role="alert"], .error, .message, p, span, div');
+            return Array.from(els).filter(e => e.textContent.trim()).slice(0,10).map(e => e.textContent.trim().slice(0,60));
+        }""")
+        if err:
+            log.debug(f"页面消息: {err}")
         return True
     log.warning("未找到提交按钮")
     return False
@@ -456,8 +472,12 @@ def main():
             log.error(f"创建邮箱失败: {e}")
             continue
 
+        profile_dir = os.getenv('CHROME_PROFILE_DIR', '/data/chrome-profile')
+        os.makedirs(profile_dir, exist_ok=True)
+
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(
+            context = pw.chromium.launch_persistent_context(
+                user_data_dir=profile_dir,
                 headless=args.headless,
                 executable_path=CHROMIUM_PATH,
                 args=[
@@ -469,10 +489,7 @@ def main():
                     '--no-first-run',
                     '--disable-sync',
                     '--disable-background-networking',
-                ]
-            )
-
-            context = browser.new_context(
+                ],
                 viewport={'width': 1920, 'height': 1080},
                 locale='en-US',
                 timezone_id='America/New_York',
@@ -565,7 +582,7 @@ def main():
             log.info(f"[*] Cookies: {len(cookies)} 个")
             log.info(f"[*] 最终 URL: {page.url}")
 
-            browser.close()
+            context.close()
 
         log.info(f"[*] 第 {rnd} 轮完成\n")
 
