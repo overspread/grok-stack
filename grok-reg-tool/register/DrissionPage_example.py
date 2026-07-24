@@ -852,24 +852,29 @@ return new Promise((resolve) => {
     if (widgetId) {
         turnstile.execute(widgetId, { callback: onToken });
         setTimeout(() => resolve('__timeout__'), timeout * 1000);
-    } else {
-        // 动态创建容器（无容器时需要），用已知 sitekey
-        let container = document.getElementById('__cf_exec_container');
-        if (!container) {
-            container = document.createElement('div');
-            container.id = '__cf_exec_container';
-            document.body.appendChild(container);
+        } else {
+            // 动态创建容器（无容器时需要），用已知 sitekey
+            let container = document.getElementById('__cf_exec_container');
+            if (!container) {
+                container = document.createElement('div');
+                container.id = '__cf_exec_container';
+                container.style.width = '300px';
+                container.style.height = '65px';
+                document.body.appendChild(container);
+            }
+            try {
+                const wid = turnstile.render(container, {
+                    sitekey: sitekey,
+                    callback: onToken,
+                });
+                setTimeout(() => {
+                    try { turnstile.execute(wid); } catch(e) {}
+                }, 300);
+                setTimeout(() => resolve('__timeout__'), timeout * 1000);
+            } catch(e) {
+                resolve('__render_error__:' + (e.message || e));
+            }
         }
-        try {
-            turnstile.render(container, {
-                sitekey: sitekey,
-                callback: onToken,
-            });
-            setTimeout(() => resolve('__timeout__'), timeout * 1000);
-        } catch(e) {
-            resolve('__render_error__:' + (e.message || e));
-        }
-    }
 });
         """,
         timeout,
@@ -1000,6 +1005,9 @@ def _inject_turnstile_widget(sitekey: str = TURNSTILE_SITEKEY, container_id: str
 
     Turnstile 要求容器元素有实际尺寸（不能 0x0 或 display:none），
     否则 render() 会报 'Unable to find a container'。
+
+    渲染后立即调用 turnstile.execute() 以程序化触发挑战，
+    无需用户点击复选框。
     """
     return page.run_js(r"""
 const sitekey = arguments[0];
@@ -1026,20 +1034,28 @@ try {
     container.style.zIndex = '9999';
     container.style.background = 'transparent';
 
+    function onToken(token) {
+        const inp = document.querySelector('input[name="cf-turnstile-response"]');
+        if (inp) {
+            const ns = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+            if (ns) { ns.call(inp, token); }
+            else { inp.value = token; }
+            inp.dispatchEvent(new Event('change', { bubbles: true }));
+            inp.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        window.__cf_turnstile_token = token;
+    }
+
     const wid = turnstile.render(container, {
         sitekey: sitekey,
-        callback: function(token) {
-            const inp = document.querySelector('input[name="cf-turnstile-response"]');
-            if (inp) {
-                const ns = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-                if (ns) { ns.call(inp, token); }
-                else { inp.value = token; }
-                inp.dispatchEvent(new Event('change', { bubbles: true }));
-                inp.dispatchEvent(new Event('input', { bubbles: true }));
-            }
-            window.__cf_turnstile_token = token;
-        },
+        callback: onToken,
     });
+
+    // 延迟一小段时间后程序化触发挑战，让 render 充分初始化
+    setTimeout(() => {
+        try { turnstile.execute(wid); } catch(e) { console.warn('execute failed', e); }
+    }, 300);
+
     return String(wid);
 } catch(e) {
     return '__error__:' + String(e.message || e);
