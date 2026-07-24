@@ -331,21 +331,23 @@ def fill_email_and_submit(page, email):
         log.info(f"[*] 点击提交按钮 '{btn_txt}' (disabled={is_disabled})")
         if is_disabled:
             log.warning("提交按钮被禁用，可能需 Turnstile")
-            # try JS click anyway
             page.evaluate("document.querySelector('button[type=\"submit\"]')?.click()")
         else:
             btn.click()
-        page.wait_for_timeout(2000)
-        page.wait_for_load_state('networkidle', timeout=10000)
+        page.wait_for_timeout(3000)
+        try:
+            page.wait_for_load_state('networkidle', timeout=8000)
+        except Exception:
+            pass
         cur_url = page.url
         log.info(f"[*] 提交后 URL: {cur_url}")
-        # Check for errors
-        err = page.evaluate("""() => {
-            const els = document.querySelectorAll('[role="alert"], .error, .message, p, span, div');
-            return Array.from(els).filter(e => e.textContent.trim()).slice(0,10).map(e => e.textContent.trim().slice(0,60));
+        # Check page for any messages
+        msgs = page.evaluate("""() => {
+            const els = document.querySelectorAll('[role="alert"], .text-error, .error, .message, [id*="error"], [class*="error"]');
+            return Array.from(els).filter(e => e.textContent.trim()).slice(0,5).map(e => e.textContent.trim().slice(0,80));
         }""")
-        if err:
-            log.debug(f"页面消息: {err}")
+        if msgs:
+            log.debug(f"页面消息: {msgs}")
         return True
     log.warning("未找到提交按钮")
     return False
