@@ -231,10 +231,10 @@ def get_turnstile_token(page):
 
     wid = inject_turnstile_widget(page)
     if wid:
-        log.info(f"[*] Widget 渲染成功 (id={wid})")
-        page.wait_for_timeout(3000)
+        log.info(f"[*] Widget 渲染成功 (id={wid}), 等待 iframe 加载 (8s)...")
+        page.wait_for_timeout(8000)
         click_turnstile_iframe(page)
-        t = wait_for_token(page, timeout=15)
+        t = wait_for_token(page, timeout=25)
         if t:
             log.info("[+] Phase 2 成功")
             return t
@@ -245,7 +245,8 @@ def get_turnstile_token(page):
     # ── Phase 2b: execute() ──
     log.info("[*] Phase 2b: turnstile.execute() 尝试...")
     wid2 = page.evaluate("(function(){var w=turnstile.render('#cf-turnstile-inject',{sitekey:" + json.dumps(TURNSTILE_SITEKEY) + ",callback:function(t){window.__cf_token=t;},'error-callback':function(e){window.__cf_error=e;}});setTimeout(function(){turnstile.execute(w);},500);return w;})()")
-    t = wait_for_token(page, timeout=15)
+    page.wait_for_timeout(8000)
+    t = wait_for_token(page, timeout=20)
     if t:
         log.info("[+] Phase 2b 成功")
         return t
@@ -271,17 +272,31 @@ def get_turnstile_token(page):
 # ── registration flow ──
 
 def click_signup_method(page):
-    for sel in [
-        'button:has-text("Sign up with email")',
-        'button:has-text("Email")',
-        'a:has-text("Sign up with email")',
-    ]:
-        btn = find_visible(page, [sel], timeout=2000)
-        if btn:
-            btn.click()
-            log.info("[*] 已点击\"用邮箱注册\"")
-            page.wait_for_timeout(2000)
-            return True
+    for text in ['Sign up with email', 'Email', 'sign up with email']:
+        try:
+            btn = page.locator(f'button:has-text("{text}")').first
+            if btn.is_visible(timeout=3000):
+                btn.click()
+                log.info(f"[*] 已点击\"{text}\"")
+                page.wait_for_timeout(2000)
+                return True
+        except Exception:
+            continue
+    # fallback: try any visible button that could be the email signup
+    try:
+        buttons = page.locator('button')
+        count = buttons.count()
+        for i in range(count):
+            btn = buttons.nth(i)
+            if btn.is_visible(timeout=500):
+                txt = (btn.text_content() or '').lower()
+                if 'email' in txt or 'sign up' in txt:
+                    btn.click()
+                    log.info(f"[*] 已点击 button '{txt[:30]}'")
+                    page.wait_for_timeout(2000)
+                    return True
+    except Exception:
+        pass
     return False
 
 def fill_email_and_submit(page, email):
@@ -487,22 +502,25 @@ def main():
             # 调试: 打印页面可见元素
             debug_info = page.evaluate("""() => {
                 const tags = document.querySelectorAll('button, a, input, select, textarea');
-                return Array.from(tags).slice(0,20).map(e => e.tagName + (e.type ? '['+e.type+']' : '') + (e.name ? ' name='+e.name : '') + ' "' + (e.textContent||'').trim().slice(0,40) + '"');
+                return Array.from(tags).slice(0,30).map(e => e.tagName + (e.type ? '['+e.type+']' : '') + (e.name ? ' name='+e.name : '') + ' "' + (e.textContent||'').trim().slice(0,40) + '"');
             }""")
             for line in debug_info:
                 log.debug(f"  元素: {line}")
 
-            # Turnstile
-            token = get_turnstile_token(page)
-            if token:
-                log.info(f"[+] Turnstile token: {token[:30]}...")
-            else:
-                log.warning("所有 Turnstile 方式均失败")
+            # 点击"用邮箱注册"
+            click_signup_method(page)
 
             # 填写邮箱
             if not fill_email_and_submit(page, email):
                 browser.close()
                 continue
+
+            # Turnstile (在提交邮箱后处理)
+            token = get_turnstile_token(page)
+            if token:
+                log.info(f"[+] Turnstile token: {token[:30]}...")
+            else:
+                log.warning("Turnstile 获取失败")
 
             # 等待验证码
             log.info("[*] 等待验证码...")
