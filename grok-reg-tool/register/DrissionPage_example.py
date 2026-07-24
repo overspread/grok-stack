@@ -138,6 +138,13 @@ if platform.system() == "Linux":
                 break
     # user_data_path 在 start_browser() 每轮动态设置，此处不固定
 
+_turnstile_patch_dir = os.path.join(os.path.dirname(__file__), "turnstilePatch")
+if os.path.isdir(_turnstile_patch_dir):
+    _manifest_path = os.path.join(_turnstile_patch_dir, "manifest.json")
+    if os.path.isfile(_manifest_path):
+        co.set_argument("--load-extension=" + _turnstile_patch_dir)
+        print(f"[*] 已加载 Turnstile 补丁扩展: {_turnstile_patch_dir}")
+
 co.set_timeouts(base=1)
 
 _chrome_temp_dir: str = ""
@@ -145,6 +152,8 @@ browser = None
 page = None
 
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
+
+TURNSTILE_SITEKEY = "0x4AAAAAAAhr9JGVDZbrZOo0"
 
 _sso_dir = os.path.join(os.path.dirname(__file__), "sso")
 _sso_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -349,6 +358,28 @@ return 'filled';
 
         if filled == 'filled':
             time.sleep(0.8)
+
+            turnstile_token = ""
+            turnstile_state = page.run_js(
+                """
+const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
+if (!challengeInput) {
+    const ci = document.createElement('input');
+    ci.type = 'hidden';
+    ci.name = 'cf-turnstile-response';
+    document.body.appendChild(ci);
+}
+const val = (challengeInput && String(challengeInput.value || '').trim()) || '';
+return val ? 'ready' : 'pending';
+                """
+            )
+            if turnstile_state == "pending":
+                print("[*] 注册页存在 Turnstile，自动获取 token...")
+                turnstile_token = getTurnstileToken()
+                if turnstile_token:
+                    _inject_turnstile_token(turnstile_token)
+                    print("[+] Turnstile token 已注入邮箱注册页")
+
             clicked = page.run_js(
                 r"""
 function isVisible(node) {
@@ -927,57 +958,177 @@ return extract();
     """)
 
 
-def getTurnstileToken():
+def _ensure_turnstile_loaded(max_wait: float = 15) -> bool:
+    """确保 Turnstile JS API 已加载到页面，若未加载则动态注入。"""
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        loaded = page.run_js("return typeof turnstile !== 'undefined';")
+        if loaded:
+            return True
+        page.run_js(r"""
+if (document.querySelector('script[src*="challenges.cloudflare.com/turnstile"]')) return;
+const s = document.createElement('script');
+s.src = 'https://challenges.cloudflare.com/turnstile/v0/g/api.js?render=explicit';
+s.async = true;
+s.defer = true;
+document.head.appendChild(s);
+        """)
+        time.sleep(2)
+    return bool(page.run_js("return typeof turnstile !== 'undefined';"))
+
+
+def _inject_turnstile_widget(sitekey: str = TURNSTILE_SITEKEY, container_id: str = "cf-turnstile-inject") -> str:
+    """在页面中注入一个 Turnstile widget 并返回 widget ID（空串表示失败）。"""
+    return page.run_js(r"""
+const sitekey = arguments[0];
+const containerId = arguments[1];
+try {
+    if (typeof turnstile === 'undefined') return '__no_turnstile__';
+    let container = document.getElementById(containerId);
+    if (!container) {
+        container = document.createElement('div');
+        container.id = containerId;
+        container.style.width = '0';
+        container.style.height = '0';
+        container.style.overflow = 'hidden';
+        container.style.position = 'absolute';
+        container.style.opacity = '0';
+        container.style.pointerEvents = 'none';
+        document.body.appendChild(container);
+    }
+    const existingInput = document.querySelector('input[name="cf-turnstile-response"]');
+    if (existingInput && String(existingInput.value || '').trim()) {
+        return '__already_done__';
+    }
+    const wid = turnstile.render(containerId, {
+        sitekey: sitekey,
+        callback: function(token) {
+            const inp = document.querySelector('input[name="cf-turnstile-response"]');
+            if (inp) {
+                const ns = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+                if (ns) { ns.call(inp, token); }
+                else { inp.value = token; }
+                inp.dispatchEvent(new Event('change', { bubbles: true }));
+                inp.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+            window.__cf_turnstile_token = token;
+        },
+    });
+    return String(wid);
+} catch(e) {
+    return '__error__:' + String(e.message || e);
+}
+    """, sitekey, container_id)
+
+
+def _wait_for_turnstile_token_from_widget(timeout: float = 45) -> str:
+    """等待注入的 widget 通过回调写入 token（轮询 cf-turnstile-response / window.__cf_turnstile_token）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        token = page.run_js(r"""
+const inp = document.querySelector('input[name="cf-turnstile-response"]');
+const v = (inp && String(inp.value || '').trim()) || window.__cf_turnstile_token || '';
+return v;
+        """)
+        if token:
+            return token
+        time.sleep(0.5)
+    return ""
+
+
+def _click_turnstile_iframe_checkbox(timeout: float = 30) -> bool:
+    """在页面中找到 Turnstile iframe 复选框并点击它以触发挑战。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _wait_for_turnstile_iframe(timeout=3):
+            clicked = page.run_js(r"""
+const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"], iframe[title*="challenge"], iframe[src*="turnstile"]');
+if (!iframe) return false;
+try {
+    const rect = iframe.getBoundingClientRect();
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+    iframe.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: x, clientY: y, screenX: x + 100, screenY: y + 100 }));
+    iframe.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: x, clientY: y, screenX: x + 100, screenY: y + 100 }));
+    iframe.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: x, clientY: y, screenX: x + 100, screenY: y + 100 }));
+    return true;
+} catch(e) { return false; }
+            """)
+            if clicked:
+                print("[*] Turnstile iframe 复选框已点击，等待挑战完成...")
+                return True
+        time.sleep(1)
+    return False
+
+
+def getTurnstileToken() -> str:
     """自动获取 Turnstile token（全自动，无需人工干预）：
 
     策略：
-    1. 等待 iframe 出现，轮询自动完成（共 180s）
-    2. 调用 turnstile.execute() JS API 程序化触发
-    3. 用 curl_cffi 模拟 Turnstile API 调用
-    4. 注入 token 到表单并触发事件
+    Phase 1: 页面已存在 Turnstile，等待 iframe 自动完成（30s）
+    Phase 2: 注入 Turnstile JS API + 用已知 sitekey 渲染 widget 并等待 token
+    Phase 3: curl_cffi 补充（失败率较高）
+    Phase 4: 刷新页面重试一次
     """
     _debug_page_state("Turnstile 开始")
 
-    # Phase 1: 等待 iframe + 轮询自动完成
-    print("[*] 等待 Turnstile iframe 出现并轮询自动完成（最多 180s）...")
-    deadline = time.time() + 180
-    iframe_seen = False
-    while time.time() < deadline:
-        if not iframe_seen and _wait_for_turnstile_iframe(timeout=0):
-            iframe_seen = True
+    # Phase 1: 先检查是否已有 token
+    token = _get_turnstile_response()
+    if token:
+        print(f"[+] 页面已有 Turnstile token")
+        return token
+
+    # Phase 1b: 等待 iframe 出现并自动完成
+    print("[*] Phase 1: 等待 Turnstile iframe 自动完成...")
+    if _wait_for_turnstile_iframe(timeout=30):
         token = _get_turnstile_response()
         if token:
             print(f"[+] Turnstile 自动完成")
             return token
-        time.sleep(1)
 
-    # Phase 2: 调用 turnstile.execute() JS API
-    print("[*] 尝试 turnstile.execute() 程序化触发...")
+    # Phase 2: 注入/确保 Turnstile JS API，用已知 sitekey 渲染 widget
+    print("[*] Phase 2: 注入 Turnstile JS API 并渲染 widget...")
+    _ensure_turnstile_loaded()
+    wid = _inject_turnstile_widget()
+    if wid and not str(wid).startswith("__"):
+        print(f"[*] Turnstile widget 已渲染 (id={wid[:20]}), 等待 token...")
+        token = _wait_for_turnstile_token_from_widget(timeout=45)
+        if token:
+            print(f"[+] 注入 widget 方式获取 token 成功")
+            return token
+    else:
+        print(f"[Warn] 注入 widget 结果: {wid}")
+
+    # Phase 2b: 尝试 turnstile.execute() 程序化触发
+    print("[*] Phase 2b: 尝试 turnstile.execute() 程序化触发...")
     token = _try_turnstile_execute(timeout=20)
     if token:
         print(f"[+] turnstile.execute() 成功获取 token")
         return token
-    print(f"[Warn] turnstile.execute() 结果: {token}")
 
-    # Phase 3: curl_cffi API 调用
-    print("[*] 尝试 curl_cffi Turnstile API...")
-    token = _get_turnstile_via_cffi()
+    # Phase 3: curl_cffi API 调用（用硬编码的已知 sitekey）
+    print("[*] Phase 3: 尝试 curl_cffi Turnstile API（已知 sitekey）...")
+    token = _get_turnstile_via_cffi(sitekey=TURNSTILE_SITEKEY)
     if token:
         return token
 
     # Phase 4: 刷新页面再试一次
-    print("[*] 以上均失败，刷新页面后重试...")
+    print("[*] Phase 4: 刷新页面后重试...")
     refresh_active_page()
     time.sleep(5)
     _debug_page_state("Turnstile 重试")
-    if _wait_for_turnstile_iframe(timeout=30):
+    _ensure_turnstile_loaded()
+    wid = _inject_turnstile_widget()
+    if wid and not str(wid).startswith("__"):
+        token = _wait_for_turnstile_token_from_widget(timeout=45)
+        if token:
+            print(f"[+] 刷新后 widget 方式获取 token 成功")
+            return token
+    if _wait_for_turnstile_iframe(timeout=15):
         token = _get_turnstile_response()
         if token:
             return token
-        token = _try_turnstile_execute(timeout=20)
-        if token:
-            return token
-    token = _get_turnstile_via_cffi()
+    token = _get_turnstile_via_cffi(sitekey=TURNSTILE_SITEKEY)
     if token:
         return token
 
@@ -986,11 +1137,11 @@ def getTurnstileToken():
     return ""
 
 
-def _get_turnstile_via_cffi() -> str:
+def _get_turnstile_via_cffi(sitekey: str = None) -> str:
     """用 curl_cffi 模拟 Cloudflare Turnstile API 调用获取 token。
 
     流程：
-    1. 从页面提取 sitekey
+    1. 从页面提取 sitekey（或使用传入的已知值）
     2. 通过 actions.cloudflare.com/api/v4/c/create 获取 challenge data
     3. 通过 actions.cloudflare.com/api/v4/c/challenge 获取 token
     """
@@ -1000,46 +1151,31 @@ def _get_turnstile_via_cffi() -> str:
         print("[Warn] curl_cffi 未安装，跳过 API 获取")
         return ""
 
-    # Step 1: 从页面多维度提取 sitekey
-    sitekey = _extract_sitekey_aggressive()
+    # Step 1: 获取 sitekey
     if not sitekey:
-        print("[Warn] 未找到 Turnstile sitekey，尝试从当前 URL 刷新后重试...")
-        refresh_active_page()
-        time.sleep(5)
         sitekey = _extract_sitekey_aggressive()
     if not sitekey:
-        print("[Warn] 仍无法找到 Turnstile sitekey")
+        print("[Warn] 未找到 Turnstile sitekey")
         return ""
-
-    print(f"[*] 提取到 sitekey: {sitekey[:20]}...")
+    print(f"[*] 使用 sitekey: {sitekey[:20]}...")
 
     # Step 2: 创建 challenge
     session = cffi_requests.Session(impersonate="chrome131")
     try:
-        # cf_token_url: 获取 challenge 数据
-        cf_token_url = page.run_js(
-            """
-function extractTokenUrl() {
-    // Turnstile 1.x 的 URL 通常在 script src 或 data-cf-tokenurl
-    const script = document.querySelector('script[src*="challenges.cloudflare.com"]');
-    if (script) {
-        const src = script.src || '';
-        const m = src.match(/(https:\\/\\/challenges.cloudflare\\.com\\/token\\/v[0-9]+\\?c=[^&"]+)/);
-        if (m) return m[1];
-    }
-    return '';
+        cf_token_url = page.run_js(r"""
+const script = document.querySelector('script[src*="challenges.cloudflare.com"]');
+if (script) {
+    const src = script.src || '';
+    const m = src.match(/(https:\/\/challenges\.cloudflare\.com\/token\/v[0-9]+\?c=[^&"]+)/);
+    if (m) return m[1];
 }
-return extractTokenUrl();
-            """
-        )
+return '';
+        """)
 
         if not cf_token_url:
-            print("[Warn] 未找到 cf-token-url")
-            return ""
+            cf_token_url = "https://challenges.cloudflare.com/token/v1"
+            print(f"[*] 使用默认 cf-token-url")
 
-        print(f"[*] cf-token-url: {cf_token_url[:60]}...")
-
-        # 创建 challenge
         challenge_resp = session.post(
             cf_token_url,
             json={
@@ -1066,7 +1202,6 @@ return extractTokenUrl();
 
         print(f"[*] Challenge 创建成功，开始获取 token...")
 
-        # Step 3: 轮询获取 token
         token_session = cffi_requests.Session(impersonate="chrome131")
         deadline = time.time() + 60
         poll_count = 0
@@ -1083,7 +1218,6 @@ return extractTokenUrl();
                 if token_value:
                     print(f"[+] Turnstile token 获取成功（第 {poll_count} 轮）")
                     return token_value
-
             time.sleep(1)
 
         print(f"[Warn] Turnstile API 轮询超时（{poll_count} 轮）")
@@ -1092,8 +1226,6 @@ return extractTokenUrl();
     except Exception as e:
         print(f"[Warn] curl_cffi Turnstile API 获取失败: {e}")
         return ""
-    finally:
-        pass  # session 自动关闭
 
 
 _GIVEN_NAMES = [
@@ -1319,6 +1451,15 @@ return value ? 'ready' : 'pending';
                 _inject_turnstile_token(turnstile_token)
             else:
                 print("[Warn] Turnstile token 获取失败，尝试直接提交")
+        elif turnstile_state == "not-found":
+            print("[*] 最终注册页未发现 Turnstile 输入框，尝试确保 Turnstile API 已加载...")
+            if _ensure_turnstile_loaded():
+                _inject_turnstile_widget()
+                token = _wait_for_turnstile_token_from_widget(timeout=30)
+                if token:
+                    print("[+] 注入 widget 成功获取 Turnstile token")
+                    _inject_turnstile_token(token)
+                    turnstile_token = token
 
         time.sleep(1)
 
