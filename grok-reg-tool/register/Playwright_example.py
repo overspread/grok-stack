@@ -133,7 +133,11 @@ def find_visible(page, selectors, timeout=3000):
 def debug_turnstile_state(page, phase):
     url = page.url
     has_ts = page.evaluate("typeof turnstile !== 'undefined'")
-    widgets = page.evaluate("window.turnstile ? turnstile.getWidgets().length : 0")
+    widgets = 0
+    try:
+        widgets = page.evaluate("window.turnstile && typeof turnstile.getWidgets === 'function' ? turnstile.getWidgets().length : 0")
+    except Exception:
+        pass
     cf_resp = page.evaluate("(document.querySelector('[name=cf-turnstile-response]') || {}).value || ''")
     has_iframe = page.evaluate("document.querySelector('iframe[src*=\"challenges.cloudflare.com\"]') !== null")
 
@@ -266,8 +270,25 @@ def get_turnstile_token(page):
 
 # ── registration flow ──
 
+def click_signup_method(page):
+    for sel in [
+        'button:has-text("Sign up with email")',
+        'button:has-text("Email")',
+        'a:has-text("Sign up with email")',
+    ]:
+        btn = find_visible(page, [sel], timeout=2000)
+        if btn:
+            btn.click()
+            log.info("[*] 已点击\"用邮箱注册\"")
+            page.wait_for_timeout(2000)
+            return True
+    return False
+
 def fill_email_and_submit(page, email):
     log.info("[*] 填写邮箱...")
+
+    click_signup_method(page)
+
     inp = find_visible(page, [
         'input[name="email"]',
         'input[type="email"]',
