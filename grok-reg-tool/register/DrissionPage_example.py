@@ -736,59 +736,91 @@ return String(input.value || '') === token;
         return False
 
 
+def _extract_sitekey_aggressive() -> str:
+    """从页面多维度提取 Turnstile sitekey。"""
+    return page.run_js(r"""
+function extract() {
+    // 1. 标准 class / data-sitekey
+    const containers = document.querySelectorAll('.cf-turnstile, [data-sitekey]');
+    if (containers.length) {
+        return String(containers[0].getAttribute('data-sitekey') || '').trim();
+    }
+    // 2. 查找 iframe 的 src 参数
+    const iframes = document.querySelectorAll('iframe[src*="turnstile"], iframe[src*="challenges.cloudflare"]');
+    for (const f of iframes) {
+        const src = f.src || '';
+        const m = src.match(/[?&]sitekey=([^&]+)/);
+        if (m) return m[1];
+    }
+    // 3. 查找所有 script 标签中的 sitekey 变量
+    const scripts = document.querySelectorAll('script');
+    for (const s of scripts) {
+        const text = s.textContent || '';
+        const m = text.match(/['"]sitekey['"]\s*[:=]\s*['"]([^'"]+)['"]/);
+        if (m) return m[1];
+        const m2 = text.match(/turnstile\.render\s*\([^)]*['"]?sitekey['"]?\s*[:=]\s*['"]([^'"]+)['"]/);
+        if (m2) return m2[1];
+    }
+    // 4. 查找全局 turnstile 配置
+    try {
+        if (window.turnstile && turnstile._cf) {
+            const key = turnstile._cf.key || turnstile._cf.sitekey;
+            if (key) return key;
+        }
+    } catch(e) {}
+    // 5. 正则全局扫描 HTML
+    const html = document.documentElement.outerHTML;
+    const m = html.match(/data-sitekey=["']([^"']+)["']/);
+    if (m) return m[1];
+    const m2 = html.match(/sitekey["']?\s*[:=]\s*["']([^"']+)["']/);
+    if (m2) return m2[1];
+    return '';
+}
+return extract();
+    """)
+
+
 def getTurnstileToken():
-    """自动等待/注入 Turnstile token：
+    """自动获取 Turnstile token（全自动，无需人工干预）：
 
-    1. 先等待 Turnstile iframe 出现（最多 30s），让 Cloudflare 风控判定浏览器指纹
-    2. 轮询检查 turnstile.getResponse() / hidden input 是否已自动填充
-    3. 如果 90s 内自动完成，直接返回 token
-    4. 否则等待用户通过 noVNC 完成（最多再等 210s），共 300s
-    5. 最后尝试用 curl_cffi 调用 Turnstile API 获取 token 并注入
+    1. 先等待 Turnstile iframe 出现（最多 60s）
+    2. 轮询检查 turnstile.getResponse() 是否已自动完成（最多 180s）
+    3. 若未自动完成，直接用 curl_cffi 通过 Turnstile API 获取 token
+    4. 若首次失败，刷新页面等待 iframe 再重试一次
     """
-    timeout = int(os.environ.get("MANUAL_TURNSTILE_TIMEOUT", "300"))
-    takeover_url = os.environ.get(
-        "MANUAL_TURNSTILE_URL",
-        "http://127.0.0.1:6080/vnc.html",
-    )
-
     # Phase 1: 等待 iframe 出现
     print("[*] 等待 Turnstile iframe 出现...")
-    if not _wait_for_turnstile_iframe(timeout=30):
-        print("[Warn] Turnstile iframe 未在 30s 内出现，继续轮询 token...")
+    if not _wait_for_turnstile_iframe(timeout=60):
+        print("[Warn] Turnstile iframe 未在 60s 内出现，尝试从页面其他位置提取 sitekey...")
 
-    # Phase 2: 轮询自动解决的 token（最多 90s）
-    print("[*] 轮询 Turnstile 自动完成（最多 90s）...")
-    deadline_auto = time.time() + min(90, timeout)
+    # Phase 2: 轮询自动解决的 token（最多 180s）
+    print("[*] 轮询 Turnstile 自动完成（最多 180s）...")
+    deadline_auto = time.time() + 180
     poll_count = 0
     while time.time() < deadline_auto:
         poll_count += 1
         token = _get_turnstile_response()
         if token:
-            print(f"[+] Turnstile 自动完成（第 {poll_count} 轮，{time.time() - deadline_auto + 90:.0f}s）")
+            print(f"[+] Turnstile 自动完成（第 {poll_count} 轮）")
             return token
         time.sleep(1)
 
-    # Phase 3: 人工接管模式（noVNC），剩余超时时间内等待
-    remaining = max(0, timeout - (time.time() - deadline_auto + 90))
-    if remaining > 0:
-        print(f"[*] Turnstile 未自动完成，等待人工通过 noVNC 验证（剩余 {remaining:.0f}s）...")
-        print(f"    访问: {takeover_url}")
+    # Phase 3: 用 curl_cffi 直接调 Turnstile API
+    print("[*] Turnstile 未自动完成，尝试 curl_cffi 直接获取 token...")
+    token = _get_turnstile_via_cffi()
+    if token:
+        return token
 
-        def read_response():
-            refresh_active_page()
-            return _get_turnstile_response()
+    print("[*] 首次 curl_cffi 失败，重新加载页面后再试一次...")
+    refresh_active_page()
+    time.sleep(3)
+    if _wait_for_turnstile_iframe(timeout=30):
+        token = _get_turnstile_via_cffi()
+        if token:
+            return token
 
-        result = wait_for_manual_turnstile(
-            read_response,
-            timeout=int(remaining),
-            takeover_url=takeover_url,
-        )
-        if result:
-            return result
-
-    # Phase 4: 终极方案 — 用 curl_cffi 直接调 Turnstile API
-    print("[*] 人工验证也超时，尝试 curl_cffi 直接获取 Turnstile token...")
-    return _get_turnstile_via_cffi()
+    print("[Warn] Turnstile token 获取失败，继续尝试提交（可能不需要 Turnstile）")
+    return ""
 
 
 def _get_turnstile_via_cffi() -> str:
@@ -805,26 +837,15 @@ def _get_turnstile_via_cffi() -> str:
         print("[Warn] curl_cffi 未安装，跳过 API 获取")
         return ""
 
-    # Step 1: 从页面提取 sitekey
-    sitekey = page.run_js(
-        """
-// 寻找 Turnstile widget 容器上的 sitekey
-const containers = document.querySelectorAll('.cf-turnstile, [data-sitekey]');
-if (containers.length) {
-    return String(containers[0].getAttribute('data-sitekey') || '').trim();
-}
-// 查找 iframe 的 src 参数
-const iframes = document.querySelectorAll('iframe[src*="turnstile"]');
-if (iframes.length) {
-    const src = iframes[0].src || '';
-    const m = src.match(/[?&]sitekey=([^&]+)/);
-    if (m) return m[1];
-}
-return '';
-        """
-    )
+    # Step 1: 从页面多维度提取 sitekey
+    sitekey = _extract_sitekey_aggressive()
     if not sitekey:
-        print("[Warn] 未找到 Turnstile sitekey")
+        print("[Warn] 未找到 Turnstile sitekey，尝试从当前 URL 刷新后重试...")
+        refresh_active_page()
+        time.sleep(5)
+        sitekey = _extract_sitekey_aggressive()
+    if not sitekey:
+        print("[Warn] 仍无法找到 Turnstile sitekey")
         return ""
 
     print(f"[*] 提取到 sitekey: {sitekey[:20]}...")
@@ -965,7 +986,7 @@ def build_profile():
     return given_name, family_name, password
 
 
-def fill_profile_and_submit(timeout=30):
+def fill_profile_and_submit(timeout=360):
     # 在验证码通过后，直接锁定“可见且可写”的真实输入框，避免命中隐藏节点或 React 受控副本。
     given_name, family_name, password = build_profile()
     deadline = time.time() + timeout
@@ -1128,9 +1149,12 @@ return value ? 'ready' : 'pending';
         )
 
         if turnstile_state == "pending" and not turnstile_token:
-            print("[*] 检测到最终注册页存在 Turnstile，切换为人工接管模式。")
+            print("[*] 检测到最终注册页存在 Turnstile，自动获取 token...")
             turnstile_token = getTurnstileToken()
-            print("[*] Turnstile 已由浏览器原生完成，无需脚本写入响应。")
+            if turnstile_token:
+                print("[+] Turnstile token 获取成功。")
+            else:
+                print("[Warn] Turnstile token 获取失败，尝试直接提交（可能表单不要求 Turnstile）")
 
         time.sleep(1.2)
 
@@ -1142,34 +1166,31 @@ return value ? 'ready' : 'pending';
         if not submit_button:
             clicked = page.run_js(
                 r"""
-const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
-if (challengeInput && !String(challengeInput.value || '').trim()) {
-    return false;
+function isVisible(node) {
+    if (!node) return false;
+    const s = window.getComputedStyle(node);
+    if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+    const r = node.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
 }
 const buttons = Array.from(document.querySelectorAll('button[type="submit"], button'));
 const submitButton = buttons.find((node) => {
+    if (!isVisible(node) || node.disabled || node.getAttribute('aria-disabled') === 'true') return false;
     const text = (node.innerText || node.textContent || '').replace(/\s+/g, '');
-    const t = text.toLowerCase(); return text === '完成注册' || text.includes('完成注册') || t.includes('create account') || t.includes('sign up') || t.includes('complete');
+    const t = text.toLowerCase();
+    return text === '完成注册' || text.includes('完成注册') || t.includes('create account') || t.includes('sign up') || t.includes('complete');
 });
-if (!submitButton || submitButton.disabled || submitButton.getAttribute('aria-disabled') === 'true') {
-    return false;
-}
+if (!submitButton) return false;
 submitButton.focus();
 submitButton.click();
 return true;
                 """
             )
         else:
-            challenge_value = page.run_js(
-                """
-const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
-return challengeInput ? String(challengeInput.value || '').trim() : 'not-found';
-                """
-            )
-            if challenge_value not in ('not-found', ''):
+            try:
                 submit_button.click()
                 clicked = True
-            else:
+            except Exception:
                 clicked = False
 
         if clicked:

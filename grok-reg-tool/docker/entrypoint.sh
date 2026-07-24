@@ -12,15 +12,14 @@ if command -v Xvfb >/dev/null 2>&1; then
   Xvfb "${DISPLAY:-:99}" -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 &
 fi
 
-# 仅供本机人工接管 Turnstile。Compose 将 6080 绑定到 127.0.0.1，
-# 不向局域网或公网暴露无密码 VNC 会话。
-if command -v x11vnc >/dev/null 2>&1; then
-  x11vnc -display "${DISPLAY:-:99}" -forever -shared -nopw \
-    -rfbport 5900 >/tmp/x11vnc.log 2>&1 &
-fi
-if command -v websockify >/dev/null 2>&1; then
-  websockify --web=/usr/share/novnc/ 6080 localhost:5900 \
-    >/tmp/novnc.log 2>&1 &
-fi
+# 人工接管 Turnstile 已移除（全自动模式），如需调试可取消注释以下行：
+# if command -v x11vnc >/dev/null 2>&1; then
+#   x11vnc -display "${DISPLAY:-:99}" -forever -shared -nopw \
+#     -rfbport 5900 >/tmp/x11vnc.log 2>&1 &
+# fi
+# if command -v websockify >/dev/null 2>&1; then
+#   websockify --web=/usr/share/novnc/ 6080 localhost:5900 \
+#     >/tmp/novnc.log 2>&1 &
+# fi
 
 exec node /app/server/dist/server/src/index.js

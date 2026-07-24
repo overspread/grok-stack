@@ -8,7 +8,6 @@ services:
     restart: unless-stopped
     ports:
       - "${WEB_PORT:-6657}:6657"
-      - "127.0.0.1:${NOVNC_PORT:-6080}:6080"
     environment:
       PORT: "6657"
       BIND_HOST: "0.0.0.0"
@@ -25,7 +24,5 @@ services:
       BROWSER_PROXY: "${BROWSER_PROXY:-}"
       BROWSER_PATH: "/usr/bin/chromium"
       COOKIE_SECURE: "${COOKIE_SECURE:-}"
-      MANUAL_TURNSTILE_TIMEOUT: "${MANUAL_TURNSTILE_TIMEOUT:-300}"
-      MANUAL_TURNSTILE_URL: "http://127.0.0.1:${NOVNC_PORT:-6080}/vnc.html"
     volumes:
       - ./data:/data
