@@ -812,50 +812,68 @@ return '';
 
 
 def _try_turnstile_execute(timeout: int = 30) -> str:
-    """程序化触发 turnstile.execute() 并等待 token。"""
+    """程序化触发 turnstile.execute() 并等待 token。
+
+    策略：
+    1. 页面上已有 widget → turnstile.execute(widgetId)
+    2. 页面上有容器但未渲染 → turnstile.render() 再 execute
+    3. 页面上无容器 → 用已知 sitekey 动态创建容器 + render
+    """
     result = page.run_js(
         r"""
 const timeout = arguments[0];
+const sitekey = arguments[1];
 return new Promise((resolve) => {
     if (typeof turnstile === 'undefined') {
         resolve('__no_turnstile__');
         return;
     }
-    // 获取当前可渲染的 widget 元素
+
     const containers = document.querySelectorAll('.cf-turnstile, [data-sitekey], [data-cf-turnstile]');
     let widgetId = null;
-    
-    // 如果已经有渲染的 widget，获取它的 widgetId
     for (const c of containers) {
         const id = c.getAttribute('data-widget-id');
         if (id) { widgetId = id; break; }
     }
-    
-    if (widgetId) {
-        // 存在已渲染的 widget，执行它
-        turnstile.execute(widgetId, {
-            callback: (token) => resolve(token),
-        });
-        setTimeout(() => resolve('__timeout__'), timeout * 1000);
-    } else if (containers.length > 0) {
-        // 有容器但未渲染，渲染后再执行
-        const container = containers[0];
-        const sitekey = container.getAttribute('data-sitekey') || '';
-        if (!sitekey) {
-            resolve('__no_sitekey__');
-            return;
+
+    function onToken(token) {
+        const inp = document.querySelector('input[name="cf-turnstile-response"]');
+        if (inp) {
+            const ns = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+            if (ns) ns.call(inp, token);
+            else inp.value = token;
+            inp.dispatchEvent(new Event('change', { bubbles: true }));
+            inp.dispatchEvent(new Event('input', { bubbles: true }));
         }
-        turnstile.render(container, {
-            sitekey: sitekey,
-            callback: (token) => resolve(token),
-        });
+        window.__cf_turnstile_token = token;
+        resolve(token);
+    }
+
+    if (widgetId) {
+        turnstile.execute(widgetId, { callback: onToken });
         setTimeout(() => resolve('__timeout__'), timeout * 1000);
     } else {
-        resolve('__no_container__');
+        // 动态创建容器（无容器时需要），用已知 sitekey
+        let container = document.getElementById('__cf_exec_container');
+        if (!container) {
+            container = document.createElement('div');
+            container.id = '__cf_exec_container';
+            document.body.appendChild(container);
+        }
+        try {
+            turnstile.render(container, {
+                sitekey: sitekey,
+                callback: onToken,
+            });
+            setTimeout(() => resolve('__timeout__'), timeout * 1000);
+        } catch(e) {
+            resolve('__render_error__:' + (e.message || e));
+        }
     }
 });
         """,
         timeout,
+        TURNSTILE_SITEKEY,
     )
     if result and not str(result).startswith("__"):
         return str(result)
@@ -978,29 +996,37 @@ document.head.appendChild(s);
 
 
 def _inject_turnstile_widget(sitekey: str = TURNSTILE_SITEKEY, container_id: str = "cf-turnstile-inject") -> str:
-    """在页面中注入一个 Turnstile widget 并返回 widget ID（空串表示失败）。"""
+    """在页面中注入一个 Turnstile widget 并返回 widget ID（空串表示失败）。
+
+    Turnstile 要求容器元素有实际尺寸（不能 0x0 或 display:none），
+    否则 render() 会报 'Unable to find a container'。
+    """
     return page.run_js(r"""
 const sitekey = arguments[0];
 const containerId = arguments[1];
 try {
     if (typeof turnstile === 'undefined') return '__no_turnstile__';
-    let container = document.getElementById(containerId);
-    if (!container) {
-        container = document.createElement('div');
-        container.id = containerId;
-        container.style.width = '0';
-        container.style.height = '0';
-        container.style.overflow = 'hidden';
-        container.style.position = 'absolute';
-        container.style.opacity = '0';
-        container.style.pointerEvents = 'none';
-        document.body.appendChild(container);
-    }
+
     const existingInput = document.querySelector('input[name="cf-turnstile-response"]');
     if (existingInput && String(existingInput.value || '').trim()) {
         return '__already_done__';
     }
-    const wid = turnstile.render(containerId, {
+
+    let container = document.getElementById(containerId);
+    if (!container) {
+        container = document.createElement('div');
+        container.id = containerId;
+        document.body.appendChild(container);
+    }
+    container.style.width = '300px';
+    container.style.height = '65px';
+    container.style.position = 'fixed';
+    container.style.bottom = '10px';
+    container.style.right = '10px';
+    container.style.zIndex = '9999';
+    container.style.background = 'transparent';
+
+    const wid = turnstile.render(container, {
         sitekey: sitekey,
         callback: function(token) {
             const inp = document.querySelector('input[name="cf-turnstile-response"]');
@@ -1166,15 +1192,27 @@ def _get_turnstile_via_cffi(sitekey: str = None) -> str:
 const script = document.querySelector('script[src*="challenges.cloudflare.com"]');
 if (script) {
     const src = script.src || '';
-    const m = src.match(/(https:\/\/challenges\.cloudflare\.com\/token\/v[0-9]+\?c=[^&"]+)/);
-    if (m) return m[1];
+    const m = src.match(/\/turnstile\/v0\/([^?]+)\?[^'"]*/);
+    const c = src.match(/[?&]c=([^&]+)/);
+    if (m && c) return 'https://challenges.cloudflare.com/turnstile/v0/' + m[1] + '?c=' + c[1];
 }
 return '';
         """)
 
         if not cf_token_url:
-            cf_token_url = "https://challenges.cloudflare.com/token/v1"
-            print(f"[*] 使用默认 cf-token-url")
+            print("[*] 未找到 cf-token-url，尝试通过 actions.cloudflare.com API 创建...")
+            create_resp = session.post(
+                f"https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/v1/c/0",
+                json={"sitekey": sitekey, "action": "sign-up", "cData": "", "reason": "onload"},
+                timeout=15,
+            )
+            if create_resp.status_code == 200:
+                create_data = create_resp.json()
+                cf_token_url = create_data.get("challenge", "")
+                print(f"[*] 通过 API 创建 cf-token-url 成功")
+            else:
+                print(f"[Warn] 通过 API 创建失败: HTTP {create_resp.status_code}")
+                return ""
 
         challenge_resp = session.post(
             cf_token_url,
