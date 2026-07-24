@@ -101,6 +101,13 @@ co.set_argument("--no-sandbox")
 co.set_argument("--disable-gpu")
 co.set_argument("--disable-dev-shm-usage")
 co.set_argument("--disable-software-rasterizer")
+co.set_argument("--disable-blink-features=AutomationControlled")
+co.set_argument("--window-size=1920,1080")
+co.set_argument("--start-maximized")
+co.set_argument("--no-first-run")
+co.set_argument("--no-default-browser-check")
+co.set_argument("--lang=en-US")
+co.set_user_agent("Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36")
 
 # 从 config.json 读取代理配置给浏览器
 _browser_proxy = ""
