@@ -4,10 +4,11 @@ Playwright + Stealth 版 Grok 注册工具
 """
 
 import os, sys, json, time, logging, argparse, re, random, string
-import requests
 from datetime import datetime
 
 from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
+
+from email_register import get_email_and_token, get_oai_code
 
 HAVE_STEALTH = False
 try:
@@ -35,17 +36,6 @@ log = setup_logging()
 # ── config ──
 SSO_DIR = os.getenv('SSO_DIR', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sso'))
 os.makedirs(SSO_DIR, exist_ok=True)
-
-MAIL_CONFIG = {
-    "mail_api_base": os.getenv('MAIL_API_BASE', 'http://localhost:8787'),
-    "mail_admin_auth": os.getenv('MAIL_ADMIN_AUTH', ''),
-    "mail_domain": os.getenv('MAIL_DOMAIN', 'yunyuc.top'),
-}
-
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
-if os.path.exists(CONFIG_FILE):
-    with open(CONFIG_FILE) as f:
-        MAIL_CONFIG.update(json.load(f))
 
 CHROMIUM_PATH = os.getenv('CHROMIUM_PATH', '/usr/bin/chromium')
 TURNSTILE_SITEKEY = os.getenv('TURNSTILE_SITEKEY', '0x4AAAAAAAhr9JGVDZbrZOo0')
@@ -121,57 +111,7 @@ STEALTH_INIT_JS = r"""
 })();
 """
 
-# ── helper: email ──
-
-def create_email():
-    api = MAIL_CONFIG['mail_api_base'].rstrip('/')
-    auth = MAIL_CONFIG['mail_admin_auth']
-    domain = MAIL_CONFIG['mail_domain']
-
-    url = f"{api}/api/v1/mail/create"
-    headers = {'Content-Type': 'application/json'}
-    if auth:
-        headers['Authorization'] = f'Bearer {auth}'
-
-    r = requests.post(url, json={"domain": domain}, headers=headers, timeout=15)
-    data = r.json()
-    if data.get('code') != 0:
-        raise RuntimeError(f"创建邮箱失败: {data}")
-
-    email = data['data']['email']
-    log.info(f"[*] 邮箱创建成功: {email}")
-    return email, data['data'].get('token', '')
-
-
-def get_verification_code(email, max_wait=120):
-    api = MAIL_CONFIG['mail_api_base'].rstrip('/')
-    auth = MAIL_CONFIG['mail_admin_auth']
-
-    url = f"{api}/api/v1/mail/messages"
-    headers = {}
-    if auth:
-        headers['Authorization'] = f'Bearer {auth}'
-
-    params = {'email': email}
-    start = time.time()
-
-    while time.time() - start < max_wait:
-        try:
-            r = requests.get(url, params=params, headers=headers, timeout=10)
-            data = r.json()
-            if data.get('code') == 0 and data.get('data'):
-                for msg in data['data']:
-                    content = msg.get('content', '') or msg.get('html', '') or ''
-                    m = re.search(r'([A-Z0-9]{3}-[A-Z0-9]{3})', content)
-                    if m:
-                        return m.group(1)
-                    m = re.search(r'(\d{6})', content)
-                    if m:
-                        return m.group(1)
-        except Exception as e:
-            log.debug(f"获取邮件失败: {e}")
-        time.sleep(5)
-    return None
+# ── helper: email (uses email_register.py) ──
 
 
 # ── element helpers ──
@@ -469,10 +409,11 @@ def main():
     log.info("═" * 50)
 
     for rnd in range(1, args.count + 1):
-        log.info(f"{'─── 第 {rnd}/{args.count} 轮 ' + '─' * 30}")
+        log.info(f"--- 第 {rnd}/{args.count} 轮 " + "-" * 30)
 
         try:
-            email, mail_token = create_email()
+            email, dev_token = get_email_and_token()
+            log.info(f"[*] 邮箱创建成功: {email}")
         except Exception as e:
             log.error(f"创建邮箱失败: {e}")
             continue
@@ -544,7 +485,7 @@ def main():
 
             # 等待验证码
             log.info("[*] 等待验证码...")
-            code = get_verification_code(email)
+            code = get_oai_code(dev_token, email, timeout=120)
             if not code:
                 log.error("验证码超时")
                 browser.close()
