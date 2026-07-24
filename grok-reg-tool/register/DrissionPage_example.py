@@ -1133,28 +1133,59 @@ def getTurnstileToken() -> str:
     _ensure_turnstile_loaded()
     wid = _inject_turnstile_widget()
     if wid and not str(wid).startswith("__"):
-        print(f"[*] Turnstile widget 已渲染 (id={wid[:20]}), 尝试点击复选框...")
-        time.sleep(2)
+        print(f"[*] Turnstile widget 已渲染 (id={wid[:20]}), 等待 iframe 加载并点击...")
         clicked = False
         try:
-            iframe_ele = page.ele('#cf-turnstile-inject iframe', timeout=5)
+            page.wait.ele_appear('#cf-turnstile-inject iframe', timeout=15)
+            iframe_ele = page.ele('#cf-turnstile-inject iframe')
             if iframe_ele:
-                iframe_ele.click()
-                clicked = True
-                print("[*] 已通过 DrissionPage 点击 Turnstile iframe")
+                rect = page.run_js("""
+const iframe = document.querySelector('#cf-turnstile-inject iframe');
+if (!iframe) return null;
+const r = iframe.getBoundingClientRect();
+return {left: r.left, top: r.top, width: r.width, height: r.height};
+                """)
+                if rect and rect.get('width', 0) > 0:
+                    cx = rect['left'] + rect['width'] / 2
+                    cy = rect['top'] + rect['height'] / 2
+                    page.actions.move_to(cx, cy).click().perform()
+                    print(f"[*] 已通过坐标点击 Turnstile iframe ({cx:.0f}, {cy:.0f})")
+                    clicked = True
+                else:
+                    iframe_ele.click()
+                    print("[*] 已通过 DrissionPage ele.click() 点击 iframe")
+                    clicked = True
         except Exception as e:
             print(f"[Warn] DrissionPage 点击 iframe 失败: {e}")
         if not clicked:
             try:
-                page.run_js(r"""
+                rect = page.run_js("""
 const iframe = document.querySelector('#cf-turnstile-inject iframe');
-if (iframe) {
-    iframe.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-}
+if (!iframe) return null;
+const r = iframe.getBoundingClientRect();
+return {left: r.left, top: r.top, width: r.width, height: r.height};
                 """)
-                print("[*] 已通过 JS dispatchEvent 点击 iframe")
+                if rect and rect.get('width', 0) > 0:
+                    cx = rect['left'] + rect['width'] / 2
+                    cy = rect['top'] + rect['height'] / 2
+                    page.run_js(f"""
+const el = document.elementFromPoint({cx:.0f}, {cy:.0f});
+if (el) {{
+    el.dispatchEvent(new MouseEvent('mousedown', {{bubbles:true, clientX:{cx:.0f}, clientY:{cy:.0f}}}));
+    el.dispatchEvent(new MouseEvent('mouseup', {{bubbles:true, clientX:{cx:.0f}, clientY:{cy:.0f}}}));
+    el.dispatchEvent(new MouseEvent('click', {{bubbles:true, clientX:{cx:.0f}, clientY:{cy:.0f}}}));
+}}
+                    """)
+                    print("[*] 已通过 elementFromPoint + dispatchEvent 点击 iframe")
+                else:
+                    page.run_js("""
+document.querySelector('#cf-turnstile-inject iframe')?.dispatchEvent(
+    new MouseEvent('click', {bubbles:true, cancelable:true})
+);
+                    """)
+                    print("[*] 已通过 JS dispatchEvent 点击 iframe")
             except Exception as e:
-                print(f"[Warn] JS 点击 iframe 失败: {e}")
+                print(f"[Warn] 备用点击失败: {e}")
         token = _wait_for_turnstile_token_from_widget(timeout=30)
         if token:
             print(f"[+] 注入 widget + 点击复选框方式获取 token 成功")
