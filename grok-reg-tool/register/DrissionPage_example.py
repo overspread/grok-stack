@@ -20,8 +20,8 @@ import time
 import secrets
 import platform
 
+import json as _json_mod
 from email_register import get_email_and_token, get_oai_code
-from manual_turnstile import wait_for_manual_turnstile
 
 
 def setup_run_logger() -> logging.Logger:
@@ -668,13 +668,74 @@ return { url: location.href, inputs, buttons };
     raise Exception("未找到验证码输入框或确认邮箱按钮")
 
 
+def _debug_page_state(label: str = ""):
+    """捕获当前页面状态用于调试。"""
+    try:
+        state = page.run_js(r"""
+const state = {
+    url: location.href,
+    title: document.title,
+    turnstileExists: typeof turnstile !== 'undefined',
+    turnstileWidgets: 0,
+    iframes: [],
+    cfResponse: '',
+    buttons: [],
+    inputs: [],
+    visibleText: '',
+};
+try {
+    const widgets = document.querySelectorAll('[class*="turnstile"], [data-sitekey]');
+    state.turnstileWidgets = widgets.length;
+} catch(e) {}
+try {
+    state.iframes = Array.from(document.querySelectorAll('iframe')).map(f => ({
+        src: (f.src || '').slice(0, 100),
+        id: f.id || '',
+    }));
+} catch(e) {}
+try {
+    const inp = document.querySelector('input[name="cf-turnstile-response"]');
+    if (inp) state.cfResponse = (inp.value || '').slice(0, 50);
+    else state.cfResponse = '__not_found__';
+} catch(e) {}
+try {
+    state.buttons = Array.from(document.querySelectorAll('button')).filter(b => {
+        const s = getComputedStyle(b);
+        return s.display !== 'none' && s.visibility !== 'hidden';
+    }).map(b => ({
+        text: (b.innerText || '').slice(0, 40),
+        disabled: b.disabled,
+    }));
+} catch(e) {}
+try {
+    state.visibleText = (document.body && document.body.innerText || '').slice(0, 300);
+} catch(e) {}
+return state;
+        """)
+        if state:
+            print(f"[Debug] 页面状态 ({label}): URL={state.get('url','')[:80]}")
+            turnstile_ok = state.get('turnstileExists')
+            widgets = state.get('turnstileWidgets', 0)
+            cf = state.get('cfResponse', '')
+            print(f"[Debug]   turnstile对象={'是' if turnstile_ok else '否'}, widgets={widgets}, cf-response={cf}")
+            if state.get('iframes'):
+                for f in state['iframes']:
+                    print(f"[Debug]   iframe: {f.get('src','')[:80]}")
+            if state.get('buttons'):
+                for b in state['buttons']:
+                    status = '✓可用' if not b.get('disabled') else '✗禁用'
+                    print(f"[Debug]   按钮 [{status}]: {b.get('text','')}")
+    except Exception as e:
+        print(f"[Debug] 页面状态捕获失败: {e}")
+
+
 def _wait_for_turnstile_iframe(timeout: float = 30) -> bool:
     """等待 Turnstile iframe 出现（DOM 就绪），超时返回 False。"""
     deadline = time.time() + timeout
     while time.time() < deadline:
         found = page.run_js(
-            """
-return !!document.querySelector('.cf-turnstile, iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]');
+            r"""
+return !!document.querySelector('.cf-turnstile, .cf-turnstile-wrapper, [data-cf-turnstile], iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]');
             """
         )
         if found:
@@ -687,7 +748,7 @@ def _get_turnstile_response() -> str:
     """读取 Turnstile challenge input 或 JS API 返回的 token。"""
     try:
         resp = page.run_js(
-            """
+            r"""
 // 1. 直接从 hidden input 读取（Turnstile 自动填充）
 const input = document.querySelector('input[name="cf-turnstile-response"]');
 if (input && String(input.value || '').trim()) {
@@ -697,9 +758,20 @@ if (input && String(input.value || '').trim()) {
 try {
     const token = (window.turnstile && turnstile.getResponse()) || '';
     if (token) return token;
-} catch (e) {
-    // turnstile widget 可能不存在或已销毁
-}
+} catch (e) {}
+// 3. 查找所有 widget 实例
+try {
+    if (window.turnstile) {
+        const widgets = document.querySelectorAll('[class*="turnstile"]');
+        for (const w of widgets) {
+            const id = w.getAttribute('data-widget-id') || w.id;
+            if (id) {
+                const t = turnstile.getResponse(id);
+                if (t) return t;
+            }
+        }
+    }
+} catch(e) {}
 return '';
             """
         )
@@ -708,13 +780,64 @@ return '';
         return ""
 
 
+def _try_turnstile_execute(timeout: int = 30) -> str:
+    """程序化触发 turnstile.execute() 并等待 token。"""
+    result = page.run_js(
+        r"""
+const timeout = arguments[0];
+return new Promise((resolve) => {
+    if (typeof turnstile === 'undefined') {
+        resolve('__no_turnstile__');
+        return;
+    }
+    // 获取当前可渲染的 widget 元素
+    const containers = document.querySelectorAll('.cf-turnstile, [data-sitekey], [data-cf-turnstile]');
+    let widgetId = null;
+    
+    // 如果已经有渲染的 widget，获取它的 widgetId
+    for (const c of containers) {
+        const id = c.getAttribute('data-widget-id');
+        if (id) { widgetId = id; break; }
+    }
+    
+    if (widgetId) {
+        // 存在已渲染的 widget，执行它
+        turnstile.execute(widgetId, {
+            callback: (token) => resolve(token),
+        });
+        setTimeout(() => resolve('__timeout__'), timeout * 1000);
+    } else if (containers.length > 0) {
+        // 有容器但未渲染，渲染后再执行
+        const container = containers[0];
+        const sitekey = container.getAttribute('data-sitekey') || '';
+        if (!sitekey) {
+            resolve('__no_sitekey__');
+            return;
+        }
+        turnstile.render(container, {
+            sitekey: sitekey,
+            callback: (token) => resolve(token),
+        });
+        setTimeout(() => resolve('__timeout__'), timeout * 1000);
+    } else {
+        resolve('__no_container__');
+    }
+});
+        """,
+        timeout,
+    )
+    if result and not str(result).startswith("__"):
+        return str(result)
+    return ""
+
+
 def _inject_turnstile_token(token: str) -> bool:
     """将 Turnstile token 注入到隐藏 input 并触发事件。"""
     if not token:
         return False
     try:
         page.run_js(
-            """
+            r"""
 const token = arguments[0];
 const input = document.querySelector('input[name="cf-turnstile-response"]');
 if (!input) return false;
@@ -728,6 +851,11 @@ if (nativeSetter) {
 }
 input.dispatchEvent(new Event('change', { bubbles: true }));
 input.dispatchEvent(new Event('input', { bubbles: true }));
+// 也尝试触发 submit 表单的 turnstile 回调
+try {
+    const form = input.closest('form');
+    if (form) form.dispatchEvent(new Event('turnstile-callback', { bubbles: true }));
+} catch(e) {}
 return String(input.value || '') === token;
             """
         )
@@ -739,12 +867,30 @@ return String(input.value || '') === token;
 def _extract_sitekey_aggressive() -> str:
     """从页面多维度提取 Turnstile sitekey。"""
     return page.run_js(r"""
-function extract() {
-    // 1. 标准 class / data-sitekey
-    const containers = document.querySelectorAll('.cf-turnstile, [data-sitekey]');
-    if (containers.length) {
-        return String(containers[0].getAttribute('data-sitekey') || '').trim();
+function walkShadowRoots(root) {
+    if (!root) return null;
+    // 查询当前 root
+    const containers = root.querySelectorAll('.cf-turnstile, .cf-turnstile-wrapper, [data-cf-turnstile], [data-sitekey]');
+    for (const c of containers) {
+        const key = c.getAttribute('data-sitekey');
+        if (key) return key;
     }
+    // 遍历 shadow DOM
+    const all = root.querySelectorAll('*');
+    for (const el of all) {
+        if (el.shadowRoot) {
+            const result = walkShadowRoots(el.shadowRoot);
+            if (result) return result;
+        }
+    }
+    return null;
+}
+
+function extract() {
+    // 1. 标准 class / data-sitekey（含 shadow DOM）
+    const shadowResult = walkShadowRoots(document);
+    if (shadowResult) return shadowResult;
+
     // 2. 查找 iframe 的 src 参数
     const iframes = document.querySelectorAll('iframe[src*="turnstile"], iframe[src*="challenges.cloudflare"]');
     for (const f of iframes) {
@@ -763,17 +909,18 @@ function extract() {
     }
     // 4. 查找全局 turnstile 配置
     try {
-        if (window.turnstile && turnstile._cf) {
-            const key = turnstile._cf.key || turnstile._cf.sitekey;
-            if (key) return key;
+        if (window.turnstile) {
+            if (turnstile._cf && turnstile._cf.key) return turnstile._cf.key;
         }
     } catch(e) {}
     // 5. 正则全局扫描 HTML
-    const html = document.documentElement.outerHTML;
-    const m = html.match(/data-sitekey=["']([^"']+)["']/);
-    if (m) return m[1];
-    const m2 = html.match(/sitekey["']?\s*[:=]\s*["']([^"']+)["']/);
-    if (m2) return m2[1];
+    try {
+        const html = document.documentElement.outerHTML;
+        const m = html.match(/data-sitekey=["']([^"']+)["']/);
+        if (m) return m[1];
+        const m2 = html.match(/["']sitekey["']\s*[:=]\s*["']([^"']+)["']/);
+        if (m2) return m2[1];
+    } catch(e) {}
     return '';
 }
 return extract();
@@ -783,43 +930,59 @@ return extract();
 def getTurnstileToken():
     """自动获取 Turnstile token（全自动，无需人工干预）：
 
-    1. 先等待 Turnstile iframe 出现（最多 60s）
-    2. 轮询检查 turnstile.getResponse() 是否已自动完成（最多 180s）
-    3. 若未自动完成，直接用 curl_cffi 通过 Turnstile API 获取 token
-    4. 若首次失败，刷新页面等待 iframe 再重试一次
+    策略：
+    1. 等待 iframe 出现，轮询自动完成（共 180s）
+    2. 调用 turnstile.execute() JS API 程序化触发
+    3. 用 curl_cffi 模拟 Turnstile API 调用
+    4. 注入 token 到表单并触发事件
     """
-    # Phase 1: 等待 iframe 出现
-    print("[*] 等待 Turnstile iframe 出现...")
-    if not _wait_for_turnstile_iframe(timeout=60):
-        print("[Warn] Turnstile iframe 未在 60s 内出现，尝试从页面其他位置提取 sitekey...")
+    _debug_page_state("Turnstile 开始")
 
-    # Phase 2: 轮询自动解决的 token（最多 180s）
-    print("[*] 轮询 Turnstile 自动完成（最多 180s）...")
-    deadline_auto = time.time() + 180
-    poll_count = 0
-    while time.time() < deadline_auto:
-        poll_count += 1
+    # Phase 1: 等待 iframe + 轮询自动完成
+    print("[*] 等待 Turnstile iframe 出现并轮询自动完成（最多 180s）...")
+    deadline = time.time() + 180
+    iframe_seen = False
+    while time.time() < deadline:
+        if not iframe_seen and _wait_for_turnstile_iframe(timeout=0):
+            iframe_seen = True
         token = _get_turnstile_response()
         if token:
-            print(f"[+] Turnstile 自动完成（第 {poll_count} 轮）")
+            print(f"[+] Turnstile 自动完成")
             return token
         time.sleep(1)
 
-    # Phase 3: 用 curl_cffi 直接调 Turnstile API
-    print("[*] Turnstile 未自动完成，尝试 curl_cffi 直接获取 token...")
+    # Phase 2: 调用 turnstile.execute() JS API
+    print("[*] 尝试 turnstile.execute() 程序化触发...")
+    token = _try_turnstile_execute(timeout=20)
+    if token:
+        print(f"[+] turnstile.execute() 成功获取 token")
+        return token
+    print(f"[Warn] turnstile.execute() 结果: {token}")
+
+    # Phase 3: curl_cffi API 调用
+    print("[*] 尝试 curl_cffi Turnstile API...")
     token = _get_turnstile_via_cffi()
     if token:
         return token
 
-    print("[*] 首次 curl_cffi 失败，重新加载页面后再试一次...")
+    # Phase 4: 刷新页面再试一次
+    print("[*] 以上均失败，刷新页面后重试...")
     refresh_active_page()
-    time.sleep(3)
+    time.sleep(5)
+    _debug_page_state("Turnstile 重试")
     if _wait_for_turnstile_iframe(timeout=30):
-        token = _get_turnstile_via_cffi()
+        token = _get_turnstile_response()
         if token:
             return token
+        token = _try_turnstile_execute(timeout=20)
+        if token:
+            return token
+    token = _get_turnstile_via_cffi()
+    if token:
+        return token
 
-    print("[Warn] Turnstile token 获取失败，继续尝试提交（可能不需要 Turnstile）")
+    _debug_page_state("Turnstile 最终失败")
+    print("[Warn] 所有 Turnstile 获取方式均失败，尝试直接提交")
     return ""
 
 
@@ -1152,11 +1315,12 @@ return value ? 'ready' : 'pending';
             print("[*] 检测到最终注册页存在 Turnstile，自动获取 token...")
             turnstile_token = getTurnstileToken()
             if turnstile_token:
-                print("[+] Turnstile token 获取成功。")
+                print("[+] Turnstile token 获取成功，注入到表单...")
+                _inject_turnstile_token(turnstile_token)
             else:
-                print("[Warn] Turnstile token 获取失败，尝试直接提交（可能表单不要求 Turnstile）")
+                print("[Warn] Turnstile token 获取失败，尝试直接提交")
 
-        time.sleep(1.2)
+        time.sleep(1)
 
         try:
             submit_button = page.ele('tag:button@@text()=完成注册') or page.ele('tag:button@@text():Create Account') or page.ele('tag:button@@text():Sign up')
@@ -1195,6 +1359,22 @@ return true;
 
         if clicked:
             print(f"[*] 已填写注册资料并点击完成注册: {given_name} {family_name} / {password}")
+            time.sleep(3)
+            current_url = ""
+            try:
+                current_url = page.url or ""
+            except Exception:
+                pass
+            if current_url and "sign-up" in current_url:
+                error_text = page.run_js(r"""
+try {
+    const errEls = document.querySelectorAll('[role="alert"], .error, .error-message, [data-error], .text-red-500, .text-error');
+    return Array.from(errEls).map(e => (e.textContent || '').trim()).filter(Boolean).join(' | ');
+} catch(e) { return ''; }
+                """)
+                if error_text:
+                    print(f"[Warn] 提交后页面显示错误: {error_text}")
+                _debug_page_state("提交后仍停留在注册页")
             return {
                 "given_name": given_name,
                 "family_name": family_name,
@@ -1203,6 +1383,7 @@ return true;
 
         time.sleep(0.5)
 
+    _debug_page_state("fill_profile 最终失败")
     raise Exception("未找到最终注册表单或完成注册按钮")
 
 
