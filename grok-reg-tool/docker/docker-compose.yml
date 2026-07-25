@@ -1,5 +1,6 @@
 services:
   grok-reg-tool:
+    platform: linux/amd64
     build:
       context: ..
       dockerfile: docker/Dockerfile

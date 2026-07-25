@@ -32,17 +32,33 @@ PROFILE_DIR = os.getenv('CHROME_PROFILE_DIR', '/data/chrome-profile')
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
 
 
+def ensure_xvfb():
+    """确保虚拟显示可用"""
+    import glob
+    d = os.environ.get('DISPLAY', ':99')
+    display_num = d.lstrip(':')
+    if glob.glob(f'/tmp/.X11-unix/X{display_num}*'):
+        return
+    from subprocess import run, DEVNULL
+    log.warning(f'Starting Xvfb on {d} ...')
+    run(['Xvfb', d, '-screen', '0', '1280x720x24'],
+        stdout=DEVNULL, stderr=DEVNULL, timeout=5)
+    time.sleep(1)
+
+
 def start_sb():
+    ensure_xvfb()
     from seleniumbase import SB
-    sb = SB(uc=True, incognito=True, headless=False,
-            browser='chrome', binary_location=CHROMIUM_PATH,
-            user_data_dir=PROFILE_DIR)
-    sb.__enter__()
-    return sb
+    sb_ctx = SB(uc=True, incognito=True, headless=False, xvfb=True,
+                browser='chrome', binary_location=CHROMIUM_PATH,
+                user_data_dir=PROFILE_DIR,
+                agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36")
+    sb = sb_ctx.__enter__()
+    return sb_ctx, sb
 
 
-def stop_sb(sb):
-    sb.__exit__(None, None, None)
+def stop_sb(ctx, sb):
+    ctx.__exit__(None, None, None)
 
 
 def solve_turnstile(sb, label="Turnstile"):
@@ -86,7 +102,7 @@ def main():
             log.error(f"创建邮箱失败: {e}")
             continue
 
-        sb = start_sb()
+        sb_ctx, sb = start_sb()
         try:
             # ── 1. 打开注册页（断开 CDP 连接加载，避免被检测）──
             log.info("[*] 打开 x.ai 注册页 (UC Mode, 断开 CDP 加载)...")
@@ -302,7 +318,7 @@ def main():
         except Exception as e:
             log.error(f"注册过程异常: {e}", exc_info=True)
         finally:
-            stop_sb(sb)
+            stop_sb(sb_ctx, sb)
 
         log.info(f"[*] 第 {rnd} 轮完成")
 
