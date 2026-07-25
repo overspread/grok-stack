@@ -42,6 +42,9 @@ RUN apt-get update \
       libgtk-3-0 \
       libx11-xcb1 \
       libxtst6 \
+      python3-tk \
+      wget \
+      unzip \
  && rm -rf /var/lib/apt/lists/*
 
 # 内置 Python 注册机及其依赖(DrissionPage / curl_cffi / requests)

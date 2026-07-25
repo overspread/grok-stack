@@ -517,7 +517,7 @@ def main():
                 page.wait_for_timeout(5000)
             except Exception as e:
                 log.error(f"页面加载失败: {e}")
-                browser.close()
+                context.close()
                 continue
 
             # 调试: 打印页面可见元素
@@ -527,6 +527,25 @@ def main():
             }""")
             for line in debug_info:
                 log.debug(f"  元素: {line}")
+
+            # 点击 Cloudflare Turnstile 挑战按钮 (如果有)
+            try:
+                cf_btn = page.locator('button:has-text("Click to reveal")')
+                if cf_btn.is_visible(timeout=3000):
+                    cf_btn.click()
+                    log.info("[*] 已点击 Cloudflare Turnstile 按钮")
+                    page.wait_for_timeout(5000)
+                    page.wait_for_load_state('networkidle', timeout=15000)
+            except Exception:
+                pass
+
+            # 再次调试页面
+            debug_info2 = page.evaluate("""() => {
+                const tags = document.querySelectorAll('button, a, input, select, textarea');
+                return Array.from(tags).slice(0,30).map(e => e.tagName + (e.type ? '['+e.type+']' : '') + (e.name ? ' name='+e.name : '') + ' visible=' + (e.offsetParent!==null) + ' "' + (e.textContent||'').trim().slice(0,30) + '"');
+            }""")
+            for line in debug_info2:
+                log.debug(f"  CF后元素: {line}")
 
             # 点击"用邮箱注册"
             click_signup_method(page)
@@ -541,7 +560,7 @@ def main():
 
             # 填写邮箱
             if not fill_email_and_submit(page, email):
-                browser.close()
+                context.close()
                 continue
 
             # Turnstile (在提交邮箱后处理)
@@ -556,7 +575,7 @@ def main():
             code = get_oai_code(dev_token, email, timeout=120)
             if not code:
                 log.error("验证码超时")
-                browser.close()
+                context.close()
                 continue
             log.info(f"[*] 验证码: {code}")
 
